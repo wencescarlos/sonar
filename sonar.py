@@ -19,11 +19,17 @@ Configuration:
     count: 3
     interval: 60
     restart_threshold: 10
+    log_path: /home/pi/printer_data/logs/sonar.log
+    status_file: /home/pi/printer_data/logs/sonar_estado.json
 
   If "auto" is set for the target, the default gateway (router IP) is determined
   automatically.
 
 Note: If persistent_log is enabled, logs will be written to /var/log/sonar.log.
+log_path (optional) also writes the log to that file (rotated at 1 MB, 2 copies),
+for example inside printer_data/logs so Mainsail shows it. status_file (optional)
+keeps a small JSON with the count and time of WiFi losses and reconnections; it is
+only written at start and on each loss/reconnection.
 """
 
 import subprocess
@@ -34,6 +40,8 @@ import re
 import sys
 import shutil
 import logging
+import logging.handlers
+import json
 
 
 class SonarDaemon:
@@ -71,6 +79,19 @@ class SonarDaemon:
                 self.logger.warning(f"No permission to write to {log_file}. "
                                     f"Using stdout instead.")
 
+        # Optional extra log file (e.g. printer_data/logs, visible from Mainsail)
+        if self.config['log_path']:
+            try:
+                fh = logging.handlers.RotatingFileHandler(
+                    self.config['log_path'], maxBytes=1_000_000, backupCount=2, encoding='utf-8')
+                fh.setFormatter(formatter)
+                self.logger.addHandler(fh)
+                self._give_to_folder_owner(self.config['log_path'])
+            except OSError as e:
+                self.logger.warning(f"Cannot write log to {self.config['log_path']}: {e}")
+
+        self.status = self.load_status()
+
         self.logger.info("Starting Sonar – WiFi Keepalive Daemon.")
 
         self.logger.info(f"Configuration loaded:")
@@ -81,6 +102,8 @@ class SonarDaemon:
         self.logger.info(f"  count: {self.config['count']}")
         self.logger.info(f"  interval: {self.config['interval']}")
         self.logger.info(f"  restart_threshold: {self.config['restart_threshold']}")
+        self.logger.info(f"  log_path: {self.config['log_path'] or '-'}")
+        self.logger.info(f"  status_file: {self.config['status_file'] or '-'}")
 
         # Set debug level if needed
         if self.config['debug_log']:
@@ -105,7 +128,9 @@ class SonarDaemon:
             'target': 'auto',
             'count': '3',
             'interval': '60',
-            'restart_threshold': '10'
+            'restart_threshold': '10',
+            'log_path': '',
+            'status_file': ''
         }
 
         if not cp.has_section('sonar'):
@@ -118,8 +143,50 @@ class SonarDaemon:
             'target': cp.get('sonar', 'target'),
             'count': cp.getint('sonar', 'count'),
             'interval': cp.getint('sonar', 'interval'),
-            'restart_threshold': cp.getint('sonar', 'restart_threshold')
+            'restart_threshold': cp.getint('sonar', 'restart_threshold'),
+            'log_path': cp.get('sonar', 'log_path').strip(),
+            'status_file': cp.get('sonar', 'status_file').strip()
         }
+
+    # --- Status file: count and time of WiFi losses (optional, status_file) ---
+    @staticmethod
+    def _give_to_folder_owner(path):
+        # The service runs as root; leave the file owned like its folder so the
+        # user (and Moonraker) can rotate or delete it.
+        try:
+            st = os.stat(os.path.dirname(os.path.abspath(path)))
+            os.chown(path, st.st_uid, st.st_gid)
+        except (OSError, AttributeError):  # AttributeError: no chown on this OS
+            pass
+
+    def load_status(self):
+        status = {'started': None, 'losses': 0, 'last_loss': None,
+                  'last_reconnect': None, 'events': []}
+        path = self.config['status_file']
+        if path and os.path.exists(path):
+            try:
+                with open(path) as f:
+                    status.update(json.load(f))
+            except (OSError, ValueError) as e:
+                self.logger.warning(f"Cannot read status file {path}: {e}")
+        return status
+
+    def save_status(self):
+        path = self.config['status_file']
+        if not path:
+            return
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.status, f, indent=1)
+            os.replace(tmp, path)
+            self._give_to_folder_owner(path)
+        except OSError as e:
+            self.logger.warning(f"Cannot write status file {path}: {e}")
+
+    def record_event(self, **event):
+        self.status['events'] = (self.status.get('events') or [])[-19:] + [event]
+        self.save_status()
 
     def _is_service_active(self, service_name):
         try:
@@ -214,6 +281,9 @@ class SonarDaemon:
             self.logger.info("Sonar is disabled in the configuration. Exiting.")
             sys.exit(0)
 
+        self.status['started'] = time.time()
+        self.save_status()
+
         while True:
             gateway = self.get_default_gateway()
 
@@ -236,6 +306,10 @@ class SonarDaemon:
             if not self.ping_target(target, self.config['count']):
                 restart_threshold = self.config['restart_threshold']
                 self.logger.info(f"Connection lost – {target} is unreachable!")
+                lost_at = time.time()
+                self.status['losses'] = int(self.status.get('losses') or 0) + 1
+                self.status['last_loss'] = lost_at
+                self.save_status()
                 self.logger.info(f"Waiting {restart_threshold} seconds before"
                                  f" attempting a restart.")
                 time.sleep(restart_threshold)
@@ -257,6 +331,10 @@ class SonarDaemon:
                         retry_count = 0
 
                 self.logger.info(f"Reconnected after {used_retries} attempts.")
+                self.status['last_reconnect'] = time.time()
+                self.record_event(lost=lost_at, reconnected=self.status['last_reconnect'],
+                                  attempts=used_retries, interface=gateway['interface'],
+                                  target=target)
 
             time.sleep(self.config['interval'])
 
